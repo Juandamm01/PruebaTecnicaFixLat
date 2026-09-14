@@ -1,0 +1,213 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Fixlat application infrastructure and dashboard metrics Lambda
+
+Globals:
+  Function:
+    Timeout: 15
+    MemorySize: 512
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: fixlat
+    Description: Project name used in resource names and tags.
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+    Description: Deployment environment.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where the EC2 instance and security group are created.
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet where the EC2 instance is launched.
+  ImageId:
+    Type: AWS::EC2::Image::Id
+    Description: AMI ID for the EC2 instance, preferably Amazon Linux 2023.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type. t3.micro is eligible for the AWS Free Tier in many regions.
+  AllowedSSHCidr:
+    Type: String
+    Default: 127.0.0.1/32
+    Description: CIDR allowed to connect to SSH. Keep the default closed and provide your own trusted IP when needed.
+  DockerImageUri:
+    Type: String
+    Description: Container image URI for the Next.js application.
+  DatabaseUrl:
+    Type: String
+    NoEcho: true
+    Default: postgresql://postgres:postgres@host.docker.internal:5434/prueba_tecnica_fixlat?schema=public
+    Description: Production PostgreSQL connection string. Use RDS or another managed PostgreSQL service in production.
+  NextAuthSecret:
+    Type: String
+    NoEcho: true
+    Description: Secret used to sign Auth.js sessions.
+
+Resources:
+  DashboardMetricsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: lambda/dashboard-metrics/handler.handler
+      Runtime: nodejs20.x
+      Environment:
+        Variables:
+          DATABASE_URL: !Ref DatabaseUrl
+      Events:
+        Metrics:
+          Type: Api
+          Properties:
+            Path: /metrics
+            Method: get
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Target: es2020
+        Sourcemap: true
+        EntryPoints:
+          - lambda/dashboard-metrics/handler.ts
+        External:
+          - '@prisma/client'
+          - '@prisma/adapter-pg'
+          - pg
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access for the Fixlat Next.js application.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+          Description: Public HTTP access to the SSR application.
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedSSHCidr
+          Description: Restricted SSH administration access.
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-app-sg
+
+  AppInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !GetAtt AppSecurityGroup.GroupId
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          dnf update -y
+          dnf install -y docker
+          systemctl enable --now docker
+          usermod -aG docker ec2-user || true
+
+          # After the image is pushed to the registry, the application can be started with:
+          # docker pull ${DockerImageUri}
+          # docker run -d --name ${ProjectName}-app --restart unless-stopped -p 3000:3000 ${DockerImageUri}
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-app
+        - Key: Environment
+          Value: !Ref Environment
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-frontend
+
+  FrontendOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${ProjectName}-${Environment}-frontend-oac
+        Description: CloudFront access to the private frontend bucket.
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub ${ProjectName}-${Environment} frontend assets
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        Origins:
+          - Id: FrontendBucketOrigin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            S3OriginConfig: {}
+            OriginAccessControlId: !GetAtt FrontendOriginAccessControl.Id
+        DefaultCacheBehavior:
+          TargetOriginId: FrontendBucketOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-cdn
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${FrontendBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}
+
+Outputs:
+  DashboardMetricsApiUrl:
+    Description: API Gateway URL for the metrics Lambda.
+    Value: !Sub https://${ServerlessRestApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/Prod/metrics
+  AppInstanceId:
+    Description: EC2 instance ID for the SSR application.
+    Value: !Ref AppInstance
+  FrontendBucketName:
+    Description: Private S3 bucket for optional static assets or a future export.
+    Value: !Ref FrontendBucket
+  FrontendDistributionDomainName:
+    Description: CloudFront distribution domain for optional static frontend assets.
+    Value: !GetAtt FrontendDistribution.DomainName
